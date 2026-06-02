@@ -13,6 +13,8 @@ function App() {
   const [elapsed, setElapsed] = useState(0);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcript, setTranscript] = useState<string | null>(null);
+  const [isAsking, setIsAsking] = useState(false);
+  const [gptResponse, setGptResponse] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const dismissWindow = async () => {
@@ -46,6 +48,24 @@ function App() {
       await appWindow.show().catch(console.error);
     } finally {
       setIsCapturing(false);
+    }
+  };
+
+  const askGpt = async () => {
+    if (!screenshotPath || !transcript) return;
+    try {
+      setError(null);
+      setIsAsking(true);
+      setGptResponse(null);
+      const response = await invoke<string>('ask_gpt', {
+        screenshotPath,
+        transcript,
+      });
+      setGptResponse(response);
+    } catch (e: any) {
+      setError('GPT request failed: ' + e.toString());
+    } finally {
+      setIsAsking(false);
     }
   };
 
@@ -87,6 +107,7 @@ function App() {
         setError(null);
         setRecordingPath(null);
         setTranscript(null);
+        setGptResponse(null);
         await invoke<string>('start_recording');
         setIsRecording(true);
         setElapsed(0);
@@ -173,6 +194,13 @@ function App() {
             'Record'
           )}
         </button>
+        <button
+          onClick={askGpt}
+          disabled={!screenshotPath || !transcript || isAsking}
+          style={{ fontWeight: 'bold' }}
+        >
+          {isAsking ? 'Asking...' : 'Ask GPT'}
+        </button>
         <button onClick={dismissWindow}>Dismiss (Esc)</button>
       </div>
 
@@ -200,6 +228,19 @@ function App() {
         <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#2a2a2a', borderRadius: '8px', color: 'white', textAlign: 'left' }}>
           <strong>Transcript:</strong>
           <p style={{ margin: '0.5rem 0 0', lineHeight: '1.6' }}>{transcript}</p>
+        </div>
+      )}
+
+      {isAsking && (
+        <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#1a2a1a', borderRadius: '8px', color: '#7fff7f' }}>
+          Waiting for GPT...
+        </div>
+      )}
+
+      {gptResponse && (
+        <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#1a1a2a', borderRadius: '8px', color: '#c8c8ff', textAlign: 'left' }}>
+          <strong>GPT:</strong>
+          <p style={{ margin: '0.5rem 0 0', lineHeight: '1.7', whiteSpace: 'pre-wrap' }}>{gptResponse}</p>
         </div>
       )}
 

@@ -229,6 +229,66 @@ async fn transcribe_audio(file_path: String) -> Result<String, String> {
     Ok(text)
 }
 
+// --- GPT Integration ---
+
+#[tauri::command]
+async fn ask_gpt(screenshot_path: String, transcript: String) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose};
+
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
+
+    let image_bytes = std::fs::read(&screenshot_path)
+        .map_err(|e| format!("Failed to read screenshot: {}", e))?;
+
+    let base64_image = general_purpose::STANDARD.encode(&image_bytes);
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{}", base64_image) }
+                },
+                {
+                    "type": "text",
+                    "text": transcript
+                }
+            ]
+        }],
+        "max_tokens": 1024
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("GPT API error ({}): {}", status, body));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("No content in API response")?
+        .to_string();
+
+    Ok(text)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     dotenvy::dotenv().ok();
@@ -237,7 +297,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(RecorderState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![greet, capture_screen, start_recording, stop_recording, transcribe_audio])
+        .invoke_handler(tauri::generate_handler![greet, capture_screen, start_recording, stop_recording, transcribe_audio, ask_gpt])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
