@@ -11,6 +11,8 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingPath, setRecordingPath] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcript, setTranscript] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const dismissWindow = async () => {
@@ -47,6 +49,19 @@ function App() {
     }
   };
 
+  const transcribeFile = async (filePath: string) => {
+    try {
+      setIsTranscribing(true);
+      setTranscript(null);
+      const text = await invoke<string>('transcribe_audio', { filePath });
+      setTranscript(text);
+    } catch (e: any) {
+      setError('Transcription failed: ' + e.toString());
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
   const toggleRecording = async () => {
     if (isRecording) {
       // Stop recording
@@ -54,6 +69,8 @@ function App() {
         setError(null);
         const path = await invoke<string>('stop_recording');
         setRecordingPath(path);
+        // Auto-transcribe
+        transcribeFile(path);
       } catch (e: any) {
         setError('Stop recording failed: ' + e.toString());
       } finally {
@@ -69,6 +86,7 @@ function App() {
       try {
         setError(null);
         setRecordingPath(null);
+        setTranscript(null);
         await invoke<string>('start_recording');
         setIsRecording(true);
         setElapsed(0);
@@ -169,6 +187,19 @@ function App() {
         <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#1a3a1a', borderRadius: '8px', color: '#7fff7f' }}>
           <strong>Recording saved to:</strong><br />
           <code style={{ wordBreak: 'break-all' }}>{recordingPath}</code>
+        </div>
+      )}
+
+      {isTranscribing && (
+        <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#1a1a3a', borderRadius: '8px', color: '#7f7fff' }}>
+          <span className="transcribing-dot" /> Transcribing...
+        </div>
+      )}
+
+      {transcript && (
+        <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#2a2a2a', borderRadius: '8px', color: 'white', textAlign: 'left' }}>
+          <strong>Transcript:</strong>
+          <p style={{ margin: '0.5rem 0 0', lineHeight: '1.6' }}>{transcript}</p>
         </div>
       )}
 

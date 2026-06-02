@@ -85,3 +85,14 @@ button:focus-visible {
   color: #ff7b7b;
 }
 
+.transcribing-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  background-color: #7f7fff;
+  border-radius: 50%;
+  margin-right: 8px;
+  animation: pulse 1s ease-in-out infinite;
+  vertical-align: middle;
+}
+

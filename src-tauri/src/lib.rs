@@ -176,13 +176,68 @@ fn stop_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Stri
     Ok(handle.file_path)
 }
 
+// --- Speech Transcription ---
+
+#[tauri::command]
+async fn transcribe_audio(file_path: String) -> Result<String, String> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
+
+    let file_bytes = std::fs::read(&file_path)
+        .map_err(|e| format!("Failed to read audio file: {}", e))?;
+
+    let file_name = std::path::Path::new(&file_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(file_name)
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", "whisper-1")
+        .part("file", part);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Whisper API error ({}): {}", status, body));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let text = json["text"]
+        .as_str()
+        .ok_or("No 'text' field in API response")?
+        .to_string();
+
+    Ok(text)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenvy::dotenv().ok();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(RecorderState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![greet, capture_screen, start_recording, stop_recording])
+        .invoke_handler(tauri::generate_handler![greet, capture_screen, start_recording, stop_recording, transcribe_audio])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
