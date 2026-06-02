@@ -1,39 +1,49 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './App.css';
 
 function App() {
+  const [error, setError] = useState<string | null>(null);
+
   const dismissWindow = async () => {
-    const appWindow = getCurrentWindow();
-    await appWindow.hide();
+    try {
+      const appWindow = getCurrentWindow();
+      await appWindow.hide();
+    } catch (e: any) {
+      setError(e.toString());
+    }
   };
 
   useEffect(() => {
     const setupShortcut = async () => {
       try {
         await unregisterAll();
-        await register('CommandOrControl+Space', async (event) => {
+        await register('CommandOrControl+Shift+Space', async (event) => {
           if (event.state === 'Pressed') {
-            const appWindow = getCurrentWindow();
-            const isVisible = await appWindow.isVisible();
-            if (isVisible) {
-              await appWindow.hide();
-            } else {
-              await appWindow.show();
-              await appWindow.setFocus();
+            try {
+              const appWindow = getCurrentWindow();
+              const isVisible = await appWindow.isVisible();
+              if (isVisible) {
+                await appWindow.hide();
+              } else {
+                await appWindow.show();
+                await appWindow.setFocus();
+              }
+            } catch (e: any) {
+              setError('Shortcut handler error: ' + e.toString());
             }
           }
         });
-      } catch (error) {
-        console.error('Failed to register shortcut:', error);
+      } catch (err: any) {
+        setError('Failed to register shortcut: ' + err.toString());
       }
     };
 
     setupShortcut();
 
     return () => {
-      unregisterAll().catch(console.error);
+      unregisterAll().catch(e => console.error(e));
     };
   }, []);
 
@@ -51,7 +61,8 @@ function App() {
     <div className="container">
       <h1>GlideWin Assistant</h1>
       <p>I am your desktop AI companion.</p>
-      <p>Press <code>Ctrl+Space</code> globally to toggle this window.</p>
+      <p>Press <code>Ctrl+Shift+Space</code> globally to toggle this window.</p>
+      {error && <div style={{ color: 'red', marginTop: '1rem' }}><strong>Error:</strong> {error}</div>}
       <button onClick={dismissWindow}>Dismiss (Esc)</button>
     </div>
   );
