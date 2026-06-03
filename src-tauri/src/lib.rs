@@ -397,42 +397,97 @@ async fn ask_gpt_stream(
 
 // --- Text-to-Speech ---
 
-#[tauri::command]
-async fn speak_text(text: String) -> Result<(), String> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
+// Split text into sentences on '. ', '! ', '? ', or end-of-string.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?') {
+            match chars.peek() {
+                None | Some(' ') | Some('\n') => {
+                    let s = current.trim().to_string();
+                    if !s.is_empty() { sentences.push(s); }
+                    current = String::new();
+                }
+                _ => {}
+            }
+        }
+    }
+    let tail = current.trim().to_string();
+    if !tail.is_empty() { sentences.push(tail); }
+    sentences
+}
 
+// Fetch TTS audio bytes for a single sentence from OpenAI.
+async fn fetch_tts_bytes(api_key: &str, text: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::new();
     let response = client
         .post("https://api.openai.com/v1/audio/speech")
-        .bearer_auth(&api_key)
-        .json(&serde_json::json!({"model": "tts-1", "input": text, "voice": "alloy", "response_format": "mp3"}))
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "model": "tts-1",
+            "input": text,
+            "voice": "alloy",
+            "response_format": "mp3"
+        }))
         .send().await
         .map_err(|e| format!("TTS request failed: {}", e))?;
-
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(format!("TTS API error ({}): {}", status, body));
     }
+    response.bytes().await
+        .map_err(|e| format!("Failed to read TTS audio: {}", e))
+        .map(|b| b.to_vec())
+}
 
-    let audio_bytes = response.bytes().await
-        .map_err(|e| format!("Failed to read audio: {}", e))?.to_vec();
+#[tauri::command]
+async fn speak_text(text: String) -> Result<(), String> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    let sentences: Vec<String> = split_sentences(&text)
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    if sentences.is_empty() { return Ok(()); }
+
+    // Async→blocking bridge: TTS fetcher sends MP3 bytes; playback thread drains them in order.
+    // Buffer up to 2 sentences so the fetcher stays ahead without blocking the async task.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+
+    // One persistent audio device for the whole response — no clicks between sentences.
+    let playback = std::thread::spawn(move || -> Result<(), String> {
         use rodio::{Decoder, OutputStream, Sink};
         use std::io::Cursor;
-
         let (_stream, stream_handle) = OutputStream::try_default()
             .map_err(|e| format!("Audio output error: {}", e))?;
-        let sink = Sink::try_new(&stream_handle)
-            .map_err(|e| format!("Sink error: {}", e))?;
-        let source = Decoder::new(Cursor::new(audio_bytes))
-            .map_err(|e| format!("Decode error: {}", e))?;
-        sink.append(source);
-        sink.sleep_until_end();
+        while let Some(audio) = rx.blocking_recv() {
+            let sink = Sink::try_new(&stream_handle)
+                .map_err(|e| format!("Sink error: {}", e))?;
+            let source = Decoder::new(Cursor::new(audio))
+                .map_err(|e| format!("Decode error: {}", e))?;
+            sink.append(source);
+            sink.sleep_until_end();
+        }
         Ok(())
-    }).await.map_err(|e| format!("Playback error: {}", e))?
+    });
+
+    // Fetch each sentence's TTS audio and hand it off to the playback thread.
+    // Playback starts as soon as the first sentence is ready.
+    for sentence in &sentences {
+        let audio = fetch_tts_bytes(&api_key, sentence.trim()).await?;
+        tx.send(audio).await.map_err(|_| "Playback thread closed early".to_string())?;
+    }
+    drop(tx); // signal playback thread to exit after draining the queue
+
+    tauri::async_runtime::spawn_blocking(move || {
+        playback.join().map_err(|_| "Playback thread panicked".to_string())?
+    }).await.map_err(|e| format!("Playback join error: {}", e))?
 }
 
 // --- Agentic Loop (T0009) ---
