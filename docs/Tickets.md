@@ -1,6 +1,7 @@
 # Tickets.md
 
 ## T0001
+
 Project skeleton.
 Done when:
 
@@ -9,6 +10,7 @@ Done when:
 - Build passes
 
 ## T0002
+
 Global hotkey.
 Done when:
 
@@ -16,6 +18,7 @@ Done when:
 - Can close assistant
 
 ## T0003
+
 Screenshot capture.
 Done when:
 
@@ -23,6 +26,7 @@ Done when:
 - PNG saved locally
 
 ## T0004
+
 Microphone recording.
 Done when:
 
@@ -30,6 +34,7 @@ Done when:
 - WAV file generated
 
 ## T0005
+
 Speech transcription.
 Done when:
 
@@ -37,6 +42,7 @@ Done when:
 - Transcript displayed
 
 ## T0006
+
 GPT integration.
 Done when:
 
@@ -44,18 +50,21 @@ Done when:
 - Response displayed
 
 ## T0007
+
 Streaming responses.
 Done when:
 
 - Tokens appear incrementally
 
 ## T0008
+
 Text-to-speech.
 Done when:
 
 - Response spoken aloud
 
 ## T0009
+
 Agentic loop with PC control.
 Done when:
 
@@ -64,6 +73,7 @@ Done when:
 - Tool calls shown in collapsible UI
 
 ## T0010
+
 Widget mode UI.
 Done when:
 
@@ -73,6 +83,7 @@ Done when:
 - Escape or hotkey dismisses
 
 ## T0011
+
 Auto-activation flow.
 Done when:
 
@@ -81,6 +92,7 @@ Done when:
 - Screenshot and transcript are passed to agent without user clicking Send
 
 ## T0012
+
 Real-time voice transcription.
 Done when:
 
@@ -89,6 +101,7 @@ Done when:
 - Uses Whisper streaming or equivalent (e.g. whisper.cpp with partial results)
 
 ## T0013
+
 Silence detection and auto-submit.
 Done when:
 
@@ -97,6 +110,7 @@ Done when:
 - User can cancel or force-submit early
 
 ## T0014
+
 Fullscreen history view.
 Done when:
 
