@@ -84,15 +84,6 @@ Done when:
 
 ## T0011
 
-Auto-activation flow.
-Done when:
-
-- Pressing Ctrl+Shift+Space hides window, captures screenshot, re-shows window
-- Microphone listening starts automatically (no manual button press)
-- Screenshot and transcript are passed to agent without user clicking Send
-
-## T0012
-
 Real-time voice transcription.
 Done when:
 
@@ -100,7 +91,7 @@ Done when:
 - Replaces batch transcription (current: transcribe after stop)
 - Uses Whisper streaming or equivalent (e.g. whisper.cpp with partial results)
 
-## T0013
+## T0012
 
 Silence detection and auto-submit.
 Done when:
@@ -109,7 +100,7 @@ Done when:
 - Visual countdown shown in widget before submit
 - User can cancel or force-submit early
 
-## T0014
+## T0013
 
 Fullscreen history view.
 Done when:

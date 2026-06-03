@@ -32,7 +32,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rodio = { version = "0.19", features = ["symphonia-mp3"] }
 rig-core = "0.38.1"
 rig-derive = "0.38.1"
-tokio = { version = "1", features = ["process"] }
+tokio = { version = "1", features = ["process", "sync", "time", "macros"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"

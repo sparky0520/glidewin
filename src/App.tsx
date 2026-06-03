@@ -104,28 +104,22 @@ function App() {
     }
   };
 
-  const transcribeFile = async (filePath: string) => {
-    try {
-      setIsTranscribing(true);
-      const text = await invoke<string>('transcribe_audio', { filePath });
-      setTranscript(text);
-      setIsTranscribing(false);
-      await sendToAgent(text);
-    } catch (e: any) {
-      setIsTranscribing(false);
-      setError(e.toString());
-    }
-  };
-
   const toggleRecording = async () => {
     if (isRecording) {
       setIsRecording(false);
       setElapsed(0);
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      setIsTranscribing(true);
       try {
-        const path = await invoke<string>('stop_recording');
-        transcribeFile(path);
+        // stop_recording processes the final audio chunk and returns the full transcript
+        const finalTranscript = await invoke<string>('stop_recording');
+        setIsTranscribing(false);
+        if (finalTranscript) {
+          setTranscript(finalTranscript);
+          await sendToAgent(finalTranscript);
+        }
       } catch (e: any) {
+        setIsTranscribing(false);
         setError(e.toString());
       }
     } else {
@@ -133,7 +127,7 @@ function App() {
       setTranscript(null);
       setLastResponse(null);
       try {
-        await invoke<string>('start_recording');
+        await invoke('start_recording');
         setIsRecording(true);
         timerRef.current = setInterval(() => setElapsed(p => p + 1), 1000);
       } catch (e: any) {
@@ -169,6 +163,15 @@ function App() {
     let unlisten: (() => void) | undefined;
     listen<boolean>('agent-thinking', e => setIsAgentThinking(e.payload))
       .then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
+
+  // Accumulate real-time transcript chunks emitted during recording.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>('transcript-chunk', e => {
+      setTranscript(prev => prev ? prev + ' ' + e.payload : e.payload);
+    }).then(fn => { unlisten = fn; });
     return () => unlisten?.();
   }, []);
 

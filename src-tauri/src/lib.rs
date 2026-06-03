@@ -32,18 +32,73 @@ fn capture_screen() -> Result<String, String> {
     do_capture_screen()
 }
 
+// --- Audio helpers ---
+
+// Encode i16 samples as an in-memory WAV file.
+fn encode_wav_bytes(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if let Ok(mut writer) = hound::WavWriter::new(&mut buf, spec) {
+        for &s in samples {
+            let _ = writer.write_sample(s);
+        }
+        let _ = writer.finalize();
+    }
+    buf.into_inner()
+}
+
+// Transcribe WAV bytes via OpenAI Whisper API.
+async fn transcribe_bytes(api_key: &str, wav_bytes: Vec<u8>) -> Result<String, String> {
+    let part = reqwest::multipart::Part::bytes(wav_bytes)
+        .file_name("chunk.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", "whisper-1")
+        .part("file", part);
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("API request failed: {}", e))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Whisper API error ({}): {}", status, body));
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    Ok(json["text"].as_str().unwrap_or("").trim().to_string())
+}
+
 // --- Microphone Recording ---
 
 struct RecordingHandle {
     stop_signal: Arc<Mutex<bool>>,
     thread_handle: Option<std::thread::JoinHandle<Result<(), String>>>,
-    file_path: String,
+    // Real-time transcription
+    sample_queue: Arc<Mutex<Vec<i16>>>,
+    transcript_stop_tx: tokio::sync::watch::Sender<bool>,
+    transcript_task: tauri::async_runtime::JoinHandle<()>,
+    accumulated_transcript: Arc<Mutex<String>>,
+    sample_rate: u32,
+    channels: u16,
 }
 
 struct RecorderState(Mutex<Option<RecordingHandle>>);
 
 #[tauri::command]
-fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, String> {
+fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,9 +108,7 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
     }
 
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let filename = format!("glidewin_recording_{}.wav", timestamp);
-    let path = std::env::temp_dir().join(&filename);
-    let file_path = path.to_string_lossy().into_owned();
+    let path = std::env::temp_dir().join(format!("glidewin_recording_{}.wav", timestamp));
 
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or("No microphone found")?;
@@ -73,9 +126,12 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
     let writer = hound::WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
     let writer = Arc::new(Mutex::new(Some(writer)));
     let stop_signal = Arc::new(Mutex::new(false));
+    let sample_queue: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+    let accumulated_transcript: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
     let writer_clone = writer.clone();
     let stop_clone = stop_signal.clone();
-    let file_path_clone = file_path.clone();
+    let sample_queue_thread = sample_queue.clone();
 
     let thread_handle = std::thread::spawn(move || -> Result<(), String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -86,6 +142,7 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
         let sample_format = supported_config.sample_format();
         let config: cpal::StreamConfig = supported_config.into();
         let writer_for_cb = writer_clone.clone();
+        let queue_for_cb = sample_queue_thread.clone();
 
         let stream = match sample_format {
             cpal::SampleFormat::I16 => device.build_input_stream(
@@ -96,6 +153,9 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
                             for &sample in data { let _ = writer.write_sample(sample); }
                         }
                     }
+                    if let Ok(mut q) = queue_for_cb.lock() {
+                        q.extend_from_slice(data);
+                    }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
                 None,
@@ -105,10 +165,11 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if let Ok(mut w) = writer_for_cb.lock() {
                         if let Some(ref mut writer) = *w {
-                            for &sample in data {
-                                let _ = writer.write_sample((sample * i16::MAX as f32) as i16);
-                            }
+                            for &s in data { let _ = writer.write_sample((s * i16::MAX as f32) as i16); }
                         }
+                    }
+                    if let Ok(mut q) = queue_for_cb.lock() {
+                        for &s in data { q.push((s * i16::MAX as f32) as i16); }
                     }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
@@ -135,54 +196,135 @@ fn start_recording(state: tauri::State<'_, RecorderState>) -> Result<String, Str
         Ok(())
     });
 
-    *guard = Some(RecordingHandle { stop_signal, thread_handle: Some(thread_handle), file_path: file_path_clone });
-    Ok(file_path)
+    // Background task: every 3s drain the sample queue and emit a transcript chunk.
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let queue_task = sample_queue.clone();
+    let accum_task = accumulated_transcript.clone();
+    let app_task = app.clone();
+    let sr = sample_rate;
+    let ch = channels;
+    // Minimum samples before bothering to transcribe (~2 seconds of audio).
+    let min_samples = sr as usize * ch as usize * 2;
+
+    let transcript_task = tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+
+        loop {
+            // Wait 3 seconds or until stop is signaled.
+            tokio::select! {
+                biased;
+                _ = stop_rx.changed() => break,
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {}
+            }
+
+            let api_key = match std::env::var("OPENAI_API_KEY") {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+
+            let samples: Vec<i16> = {
+                let mut q = queue_task.lock().unwrap();
+                std::mem::take(&mut *q)
+            };
+
+            if samples.len() < min_samples { continue; }
+
+            let wav_bytes = encode_wav_bytes(&samples, sr, ch);
+
+            if let Ok(text) = transcribe_bytes(&api_key, wav_bytes).await {
+                if !text.is_empty() {
+                    let mut accum = accum_task.lock().unwrap();
+                    if !accum.is_empty() { accum.push(' '); }
+                    accum.push_str(&text);
+                    let chunk = text;
+                    drop(accum);
+                    app_task.emit("transcript-chunk", chunk).ok();
+                }
+            }
+        }
+    });
+
+    *guard = Some(RecordingHandle {
+        stop_signal,
+        thread_handle: Some(thread_handle),
+        sample_queue,
+        transcript_stop_tx: stop_tx,
+        transcript_task,
+        accumulated_transcript,
+        sample_rate: sr,
+        channels: ch,
+    });
+    Ok(())
 }
 
 #[tauri::command]
-fn stop_recording(state: tauri::State<'_, RecorderState>) -> Result<String, String> {
-    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-    let handle = guard.take().ok_or("Not currently recording")?;
+async fn stop_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let handle = {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.take().ok_or("Not currently recording")?
+    };
+
+    // Stop the recording thread.
     *handle.stop_signal.lock().unwrap() = true;
     if let Some(thread) = handle.thread_handle {
         thread.join().map_err(|_| "Recording thread panicked".to_string())??;
     }
-    Ok(handle.file_path)
+
+    // Stop the background transcription task and wait for it to exit.
+    handle.transcript_stop_tx.send(true).ok();
+    let _ = handle.transcript_task.await;
+
+    // Transcribe any samples that accumulated since the last periodic chunk.
+    let remaining: Vec<i16> = std::mem::take(&mut *handle.sample_queue.lock().unwrap());
+    let min_samples = handle.sample_rate as usize * handle.channels as usize / 2; // ~0.5s
+    if remaining.len() >= min_samples {
+        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            let wav_bytes = encode_wav_bytes(&remaining, handle.sample_rate, handle.channels);
+            if let Ok(text) = transcribe_bytes(&api_key, wav_bytes).await {
+                if !text.is_empty() {
+                    let mut accum = handle.accumulated_transcript.lock().unwrap();
+                    if !accum.is_empty() { accum.push(' '); }
+                    accum.push_str(&text);
+                    let chunk = text;
+                    drop(accum);
+                    app.emit("transcript-chunk", chunk).ok();
+                }
+            }
+        }
+    }
+
+    let final_transcript = handle.accumulated_transcript.lock().unwrap().clone();
+    Ok(final_transcript)
 }
 
-// --- Speech Transcription ---
+// --- Speech Transcription (kept for potential direct use) ---
 
 #[tauri::command]
 async fn transcribe_audio(file_path: String) -> Result<String, String> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
-
     let file_bytes = std::fs::read(&file_path)
         .map_err(|e| format!("Failed to read audio file: {}", e))?;
-
     let file_name = std::path::Path::new(&file_path)
         .file_name().unwrap_or_default().to_string_lossy().into_owned();
-
-    let part = reqwest::multipart::Part::bytes(file_bytes)
+    let wav_bytes = file_bytes;
+    let part = reqwest::multipart::Part::bytes(wav_bytes)
         .file_name(file_name).mime_str("audio/wav").map_err(|e| e.to_string())?;
-
     let form = reqwest::multipart::Form::new().text("model", "whisper-1").part("file", part);
-
     let client = reqwest::Client::new();
     let response = client
         .post("https://api.openai.com/v1/audio/transcriptions")
         .bearer_auth(&api_key).multipart(form).send().await
         .map_err(|e| format!("API request failed: {}", e))?;
-
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(format!("Whisper API error ({}): {}", status, body));
     }
-
     let json: serde_json::Value = response.json().await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
-
     Ok(json["text"].as_str().ok_or("No 'text' field in API response")?.to_string())
 }
 
