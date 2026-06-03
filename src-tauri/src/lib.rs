@@ -345,22 +345,38 @@ async fn run_powershell(
     Ok(result)
 }
 
-/// Open an application, file, or URL on Windows using the shell's default handler.
+/// Open an application, file, or URL on Windows.
+/// Examples: "notepad", "chrome", "msedge", "msedge https://youtube.com", "https://google.com"
 #[rig_tool]
 async fn open_app(
-    /// Name or path of the app/file/URL to open (e.g. "notepad", "chrome", "https://example.com")
+    /// What to open. Use Windows `start` command syntax:
+    /// bare app name ("notepad", "chrome", "msedge"), or app + URL ("msedge https://..."),
+    /// or just a URL ("https://...") which the default browser will handle.
     target: String,
 ) -> Result<String, ToolError> {
     emit_tool_event("open_app", &target, "start", None);
 
-    let result = tokio::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command",
-            &format!("Start-Process '{}'", target.replace('\'', "''"))])
+    // `cmd /c start` mirrors what the user types at the command prompt:
+    //   start notepad
+    //   start chrome "https://google.com"
+    //   start msedge "https://youtube.com"
+    // The empty first arg ("") is required by `start` when the next token is a quoted path/URL,
+    // so it isn't mistaken for a window title.
+    let args = ["/c", "start", "", &target];
+
+    let result = tokio::process::Command::new("cmd")
+        .args(args)
         .output()
         .await;
 
     match result {
-        Ok(_) => {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() && !stderr.trim().is_empty() {
+                let err = stderr.trim().to_string();
+                emit_tool_event("open_app", &target, "error", Some(&err));
+                return Err(ToolError::ToolCallError(err.into()));
+            }
             let msg = format!("Opened: {}", target);
             emit_tool_event("open_app", &target, "done", Some(&msg));
             Ok(msg)
