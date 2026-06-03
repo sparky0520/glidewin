@@ -32,25 +32,43 @@ const STATE_COLOR: Record<WidgetState, string> = {
   error:       '#ff6666',
 };
 
+// Normalized RMS threshold below which we consider it silence (0–1 scale).
+const SILENCE_THRESHOLD = 0.02;
+// How long silence must persist (ms) before auto-submitting.
+const SILENCE_DURATION_MS = 1500;
+
 // ── App ────────────────────────────────────────────────────────────────────
 
 function App() {
-  const [error, setError]                     = useState<string | null>(null);
-  const [isRecording, setIsRecording]         = useState(false);
-  const [elapsed, setElapsed]                 = useState(0);
-  const [isTranscribing, setIsTranscribing]   = useState(false);
-  const [transcript, setTranscript]           = useState<string | null>(null);
-  const [isAgentThinking, setIsAgentThinking] = useState(false);
-  const [isSpeaking, setIsSpeaking]           = useState(false);
-  const [lastResponse, setLastResponse]       = useState<string | null>(null);
-  const [activeToolCalls, setActiveToolCalls] = useState<ToolCallEntry[]>([]);
-  const [hasScreenshot, setHasScreenshot]     = useState(false);
-  const pendingToolCallsRef                   = useRef<ToolCallEntry[]>([]);
-  const timerRef                              = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Ref so sendToAgent always reads the latest path regardless of render cycle
-  const screenshotRef                         = useRef<string | null>(null);
+  const [error, setError]                       = useState<string | null>(null);
+  const [isRecording, setIsRecording]           = useState(false);
+  const [elapsed, setElapsed]                   = useState(0);
+  const [isTranscribing, setIsTranscribing]     = useState(false);
+  const [transcript, setTranscript]             = useState<string | null>(null);
+  const [isAgentThinking, setIsAgentThinking]   = useState(false);
+  const [isSpeaking, setIsSpeaking]             = useState(false);
+  const [lastResponse, setLastResponse]         = useState<string | null>(null);
+  const [activeToolCalls, setActiveToolCalls]   = useState<ToolCallEntry[]>([]);
+  const [hasScreenshot, setHasScreenshot]       = useState(false);
+  const [silenceCountdown, setSilenceCountdown] = useState<number | null>(null);
 
-  // Derived widget state — order matters: higher priority first
+  const pendingToolCallsRef  = useRef<ToolCallEntry[]>([]);
+  const timerRef             = useRef<ReturnType<typeof setInterval> | null>(null);
+  const screenshotRef        = useRef<string | null>(null);
+
+  // Silence-detection refs — avoid stale closures in the audio-level listener.
+  const isRecordingRef       = useRef(false);
+  const hasSpokeRef          = useRef(false);       // true once first speech detected this session
+  const silenceStartRef      = useRef<number | null>(null);
+  const countdownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const silenceCountdownRef  = useRef<number | null>(null); // mirror of state for keyboard handler
+
+  // Always points to the latest doStopRecording so the countdown interval can call it.
+  const doStopRef = useRef<(() => Promise<void>) | null>(null);
+
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+
+  // Derived widget state — order matters: higher priority first.
   const widgetState: WidgetState =
     error           ? 'error'        :
     isSpeaking      ? 'speaking'     :
@@ -94,9 +112,8 @@ function App() {
       pendingToolCallsRef.current = [];
       setActiveToolCalls([]);
       setLastResponse(response);
-      // Expose full tool call history via console for debugging
       if (toolCalls.length > 0) console.debug('[glidewin] tool calls:', toolCalls);
-      speakResponse(response); // fire-and-forget; manages its own isSpeaking state
+      speakResponse(response);
     } catch (e: any) {
       pendingToolCallsRef.current = [];
       setActiveToolCalls([]);
@@ -104,31 +121,59 @@ function App() {
     }
   };
 
+  const clearCountdown = () => {
+    if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null; }
+    silenceStartRef.current = null;
+    setSilenceCountdown(null);
+    silenceCountdownRef.current = null;
+  };
+
+  const doStopRecording = async () => {
+    // Guard against double-invocation (e.g. Space pressed while countdown fires).
+    if (!isRecordingRef.current) return;
+    isRecordingRef.current = false;
+
+    clearCountdown();
+    hasSpokeRef.current = false;
+    setIsRecording(false);
+    setElapsed(0);
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    setIsTranscribing(true);
+    try {
+      const finalTranscript = await invoke<string>('stop_recording');
+      setIsTranscribing(false);
+      if (finalTranscript) {
+        setTranscript(finalTranscript);
+        await sendToAgent(finalTranscript);
+      }
+    } catch (e: any) {
+      setIsTranscribing(false);
+      setError(e.toString());
+    }
+  };
+
+  // Keep doStopRef current so the countdown interval always calls the freshest version.
+  useEffect(() => { doStopRef.current = doStopRecording; });
+
+  // Cancel a pending auto-submit countdown; user must speak again to re-arm detection.
+  const cancelCountdown = () => {
+    clearCountdown();
+    hasSpokeRef.current = false;
+  };
+
   const toggleRecording = async () => {
     if (isRecording) {
-      setIsRecording(false);
-      setElapsed(0);
-      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-      setIsTranscribing(true);
-      try {
-        // stop_recording processes the final audio chunk and returns the full transcript
-        const finalTranscript = await invoke<string>('stop_recording');
-        setIsTranscribing(false);
-        if (finalTranscript) {
-          setTranscript(finalTranscript);
-          await sendToAgent(finalTranscript);
-        }
-      } catch (e: any) {
-        setIsTranscribing(false);
-        setError(e.toString());
-      }
+      await doStopRecording();
     } else {
       setError(null);
       setTranscript(null);
       setLastResponse(null);
+      hasSpokeRef.current = false;
+      silenceStartRef.current = null;
       try {
         await invoke('start_recording');
         setIsRecording(true);
+        isRecordingRef.current = true;
         timerRef.current = setInterval(() => setElapsed(p => p + 1), 1000);
       } catch (e: any) {
         setError(e.toString());
@@ -166,7 +211,6 @@ function App() {
     return () => unlisten?.();
   }, []);
 
-  // Accumulate real-time transcript chunks emitted during recording.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<string>('transcript-chunk', e => {
@@ -175,7 +219,6 @@ function App() {
     return () => unlisten?.();
   }, []);
 
-  // Store screenshot path from hotkey activation
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<string>('activate', event => {
@@ -185,10 +228,54 @@ function App() {
     return () => unlisten?.();
   }, []);
 
-  // Keyboard: Escape = dismiss, Space = toggle recording
+  // Silence detection: Rust emits normalized RMS every 100ms while recording.
+  // We start a 1.5s countdown after the first silence post-speech; expiry auto-submits.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<number>('audio-level', e => {
+      if (!isRecordingRef.current) return;
+      const rms = e.payload;
+
+      if (rms >= SILENCE_THRESHOLD) {
+        // Speech detected — arm silence detection and clear any active countdown.
+        hasSpokeRef.current = true;
+        if (silenceStartRef.current !== null || countdownIntervalRef.current) {
+          clearCountdown();
+        }
+      } else if (hasSpokeRef.current && silenceStartRef.current === null && !countdownIntervalRef.current) {
+        // Silence began after speech — start the countdown.
+        silenceStartRef.current = Date.now();
+        const startMs = Date.now();
+        countdownIntervalRef.current = setInterval(() => {
+          const remaining = Math.max(0, SILENCE_DURATION_MS - (Date.now() - startMs));
+          const secs = remaining / 1000;
+          setSilenceCountdown(secs);
+          silenceCountdownRef.current = secs;
+          if (remaining <= 0) {
+            clearInterval(countdownIntervalRef.current!);
+            countdownIntervalRef.current = null;
+            silenceStartRef.current = null;
+            setSilenceCountdown(null);
+            silenceCountdownRef.current = null;
+            doStopRef.current?.();
+          }
+        }, 50);
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => {
+      unlisten?.();
+      if (countdownIntervalRef.current) { clearInterval(countdownIntervalRef.current); countdownIntervalRef.current = null; }
+    };
+  }, []);
+
+  // Keyboard: Escape cancels countdown (or dismisses); Space toggles/force-submits.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { dismissWindow(); return; }
+      if (e.key === 'Escape') {
+        if (silenceCountdownRef.current !== null) { cancelCountdown(); return; }
+        dismissWindow();
+        return;
+      }
       if (e.key === ' ' && !isTranscribing && !isAgentThinking && !isSpeaking) {
         e.preventDefault();
         toggleRecording();
@@ -203,12 +290,12 @@ function App() {
   const runningTool = activeToolCalls.find(t => t.status === 'running');
 
   const statusLabel =
-    widgetState === 'idle'         ? 'Ready'                                  :
-    widgetState === 'listening'    ? `Listening  ${fmt(elapsed)}`              :
-    widgetState === 'transcribing' ? 'Transcribing'                            :
+    widgetState === 'idle'         ? 'Ready'                                      :
+    widgetState === 'listening'    ? `Listening  ${fmt(elapsed)}`                 :
+    widgetState === 'transcribing' ? 'Transcribing'                               :
     widgetState === 'thinking'     ? (runningTool ? runningTool.tool : 'Thinking') :
-    widgetState === 'speaking'     ? 'Speaking'                               :
-    widgetState === 'done'         ? 'Done'                                   :
+    widgetState === 'speaking'     ? 'Speaking'                                   :
+    widgetState === 'done'         ? 'Done'                                       :
     'Error';
 
   const contentLine =
@@ -218,10 +305,12 @@ function App() {
     '';
 
   const hintLine =
-    widgetState === 'idle' && hasScreenshot ? 'Screenshot ready  ·  Space to speak  ·  Esc to dismiss' :
-    widgetState === 'idle'                  ? 'Space to record  ·  Esc to dismiss'                      :
-    widgetState === 'listening'             ? 'Space to stop  ·  Esc to dismiss'                        :
-    'Esc to dismiss';
+    silenceCountdown !== null
+      ? `Submitting in ${silenceCountdown.toFixed(1)}s  ·  Space to submit now  ·  Esc to cancel`
+      : widgetState === 'idle' && hasScreenshot ? 'Screenshot ready  ·  Space to speak  ·  Esc to dismiss'
+      : widgetState === 'idle'                  ? 'Space to record  ·  Esc to dismiss'
+      : widgetState === 'listening'             ? 'Space to stop  ·  Esc to dismiss'
+      : 'Esc to dismiss';
 
   const dotClass =
     widgetState === 'listening'                                   ? 'dot dot-pulse-red'   :
@@ -243,7 +332,9 @@ function App() {
         {contentLine && <div className="content">{contentLine}</div>}
         <button className="close-btn" onClick={dismissWindow} title="Dismiss (Esc)">✕</button>
       </div>
-      <div className="hint" data-tauri-drag-region>{hintLine}</div>
+      <div className="hint" data-tauri-drag-region data-countdown={silenceCountdown !== null ? '' : undefined}>
+        {hintLine}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // Exclude the widget window from screen captures so xcap never sees it.
 // WDA_EXCLUDEFROMCAPTURE (0x11) requires Windows 10 v2004+.
@@ -93,6 +94,8 @@ struct RecordingHandle {
     accumulated_transcript: Arc<Mutex<String>>,
     sample_rate: u32,
     channels: u16,
+    level_stop_tx: tokio::sync::watch::Sender<bool>,
+    level_task: tauri::async_runtime::JoinHandle<()>,
 }
 
 struct RecorderState(Mutex<Option<RecordingHandle>>);
@@ -128,6 +131,8 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>
     let stop_signal = Arc::new(Mutex::new(false));
     let sample_queue: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
     let accumulated_transcript: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let current_rms = Arc::new(AtomicU32::new(0));
+    let current_rms_thread = current_rms.clone();
 
     let writer_clone = writer.clone();
     let stop_clone = stop_signal.clone();
@@ -156,6 +161,11 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>
                     if let Ok(mut q) = queue_for_cb.lock() {
                         q.extend_from_slice(data);
                     }
+                    if !data.is_empty() {
+                        let sq: f64 = data.iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum();
+                        let rms = (sq / data.len() as f64).sqrt() as f32;
+                        current_rms_thread.store(rms.to_bits(), Ordering::Relaxed);
+                    }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
                 None,
@@ -170,6 +180,11 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>
                     }
                     if let Ok(mut q) = queue_for_cb.lock() {
                         for &s in data { q.push((s * i16::MAX as f32) as i16); }
+                    }
+                    if !data.is_empty() {
+                        let sq: f64 = data.iter().map(|&s| (s as f64).powi(2)).sum();
+                        let rms = (sq / data.len() as f64).sqrt() as f32;
+                        current_rms_thread.store(rms.to_bits(), Ordering::Relaxed);
                     }
                 },
                 |err| eprintln!("Audio stream error: {}", err),
@@ -244,6 +259,21 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>
         }
     });
 
+    // Level monitoring: emit normalized RMS every 100ms so the frontend can detect silence.
+    let (level_tx, mut level_rx) = tokio::sync::watch::channel(false);
+    let level_task = tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        loop {
+            tokio::select! {
+                biased;
+                _ = level_rx.changed() => break,
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
+            }
+            let rms = f32::from_bits(current_rms.load(Ordering::Relaxed));
+            app.emit("audio-level", rms).ok();
+        }
+    });
+
     *guard = Some(RecordingHandle {
         stop_signal,
         thread_handle: Some(thread_handle),
@@ -253,6 +283,8 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>
         accumulated_transcript,
         sample_rate: sr,
         channels: ch,
+        level_stop_tx: level_tx,
+        level_task,
     });
     Ok(())
 }
@@ -272,9 +304,11 @@ async fn stop_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderS
         thread.join().map_err(|_| "Recording thread panicked".to_string())??;
     }
 
-    // Stop the background transcription task and wait for it to exit.
+    // Stop background tasks.
     handle.transcript_stop_tx.send(true).ok();
+    handle.level_stop_tx.send(true).ok();
     let _ = handle.transcript_task.await;
+    let _ = handle.level_task.await;
 
     // Transcribe any samples that accumulated since the last periodic chunk.
     let remaining: Vec<i16> = std::mem::take(&mut *handle.sample_queue.lock().unwrap());
