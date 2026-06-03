@@ -354,44 +354,43 @@ async fn run_powershell(
     Ok(result)
 }
 
-/// Open an application, file, or URL on Windows.
-/// Examples: "notepad", "chrome", "msedge", "msedge https://youtube.com", "https://google.com"
+/// Open an application or URL on Windows using the shell `start` command.
+/// Always prefer this over run_powershell for launching apps or websites.
 #[rig_tool]
 async fn open_app(
-    /// What to open. Use Windows `start` command syntax:
-    /// bare app name ("notepad", "chrome", "msedge"), or app + URL ("msedge https://..."),
-    /// or just a URL ("https://...") which the default browser will handle.
-    target: String,
+    /// Application to open. Use the shell name exactly as you would type it at a command prompt:
+    /// "chrome", "msedge", "firefox", "notepad", "explorer", "spotify", "code", etc.
+    /// For a URL with no specific browser, pass "https://..." here and leave url empty.
+    app: String,
+    /// Optional URL to open with the app, e.g. "https://youtube.com".
+    /// Leave empty when just launching an app without a URL.
+    url: String,
 ) -> Result<String, ToolError> {
-    emit_tool_event("open_app", &target, "start", None);
+    let label = if url.is_empty() { app.clone() } else { format!("{} {}", app, url) };
+    emit_tool_event("open_app", &label, "start", None);
 
-    // `cmd /c start` mirrors what the user types at the command prompt:
-    //   start notepad
-    //   start chrome "https://google.com"
-    //   start msedge "https://youtube.com"
-    // The empty first arg ("") is required by `start` when the next token is a quoted path/URL,
-    // so it isn't mistaken for a window title.
-    let args = ["/c", "start", "", &target];
+    // Build `cmd /c start "" <app> [url]` with each token as a separate argument
+    // so the shell never misreads a URL as a window title.
+    let mut cmd = tokio::process::Command::new("cmd");
+    cmd.args(["/c", "start", "", &app]);
+    if !url.is_empty() {
+        cmd.arg(&url);
+    }
 
-    let result = tokio::process::Command::new("cmd")
-        .args(args)
-        .output()
-        .await;
-
-    match result {
+    match cmd.output().await {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !out.status.success() && !stderr.trim().is_empty() {
                 let err = stderr.trim().to_string();
-                emit_tool_event("open_app", &target, "error", Some(&err));
+                emit_tool_event("open_app", &label, "error", Some(&err));
                 return Err(ToolError::ToolCallError(err.into()));
             }
-            let msg = format!("Opened: {}", target);
-            emit_tool_event("open_app", &target, "done", Some(&msg));
+            let msg = format!("Opened: {}", label);
+            emit_tool_event("open_app", &label, "done", Some(&msg));
             Ok(msg)
         }
         Err(e) => {
-            emit_tool_event("open_app", &target, "error", Some(&e.to_string()));
+            emit_tool_event("open_app", &label, "error", Some(&e.to_string()));
             Err(ToolError::ToolCallError(e.to_string().into()))
         }
     }
@@ -422,7 +421,12 @@ async fn agent_chat(
         .agent(openai::GPT_4O)
         .preamble(
             "You are GlideWin, an AI assistant running on the user's Windows PC. \
-             You have tools to run PowerShell commands and open applications. \
+             You have two tools: run_powershell for system commands, and open_app for launching \
+             apps or websites. To open an app use open_app with the shell name (e.g. app=\"chrome\", \
+             url=\"\"). To open a URL in a specific browser use open_app with app=\"chrome\" or \
+             app=\"msedge\" and url=\"https://...\". To open a URL in the default browser use \
+             app=\"https://...\" and url=\"\". Always prefer open_app over run_powershell for \
+             launching applications or websites. \
              Always tell the user what you are about to do before calling a tool. \
              Keep responses concise. Never delete files or make destructive changes \
              without explicit user confirmation.",
