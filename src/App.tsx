@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -168,24 +167,6 @@ function App() {
     listen<boolean>('agent-thinking', e => setIsAgentThinking(e.payload))
       .then(fn => { unlisten = fn; });
     return () => unlisten?.();
-  }, []);
-
-  // Global hotkey: Ctrl+Shift+Space toggles window visibility
-  useEffect(() => {
-    (async () => {
-      try {
-        await unregisterAll();
-        await register('CommandOrControl+Shift+Space', async event => {
-          if (event.state !== 'Pressed') return;
-          const win = getCurrentWindow();
-          if (await win.isVisible()) { await win.hide(); }
-          else { await win.show(); await win.setFocus(); }
-        });
-      } catch (err: any) {
-        setError('Shortcut: ' + err.toString());
-      }
-    })();
-    return () => { unregisterAll().catch(console.error); };
   }, []);
 
   // Keyboard: Escape = dismiss, Space = toggle recording

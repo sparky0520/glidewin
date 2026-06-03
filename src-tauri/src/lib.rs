@@ -468,12 +468,35 @@ pub fn run() {
         .manage(ConversationState(tokio::sync::Mutex::new(Vec::new())))
         .setup(|app| {
             use tauri::Manager;
+            use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
             let window = app.get_webview_window("main").unwrap();
+
+            // Pin widget to top-center of primary monitor
             if let Ok(Some(monitor)) = window.primary_monitor() {
                 let logical_w = monitor.size().width as f64 / monitor.scale_factor();
                 let x = (logical_w / 2.0 - 240.0).max(0.0);
                 window.set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y: 20.0 }))?;
             }
+
+            // Register Ctrl+Shift+Space once at the Rust level so React lifecycle
+            // (StrictMode double-mount, hot-reload) can never cause "already registered" errors.
+            let handle = app.handle().clone();
+            app.global_shortcut().on_shortcut("CommandOrControl+Shift+Space", move |_app, _shortcut, event| {
+                if event.state() != ShortcutState::Pressed { return; }
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(win) = handle.get_webview_window("main") {
+                        if win.is_visible().unwrap_or(false) {
+                            let _ = win.hide();
+                        } else {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                        }
+                    }
+                });
+            })?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
