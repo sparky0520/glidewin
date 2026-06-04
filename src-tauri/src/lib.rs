@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -524,6 +525,67 @@ async fn speak_text(text: String) -> Result<(), String> {
     }).await.map_err(|e| format!("Playback join error: {}", e))?
 }
 
+// --- Skills System ---
+
+fn skills_dir() -> PathBuf {
+    let mut p = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push("GlideWin");
+    p.push("skills");
+    std::fs::create_dir_all(&p).ok();
+    p
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SkillDef {
+    name: String,
+    description: String,
+    parameters: Vec<String>,
+    powershell_code: String,
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut tag_buf = String::new();
+
+    for ch in html.chars() {
+        if in_tag {
+            if ch == '>' {
+                let lower = tag_buf.to_ascii_lowercase();
+                let lower = lower.trim();
+                if lower.starts_with("script") || lower.starts_with("style") {
+                    in_script = true;
+                } else if lower.starts_with("/script") || lower.starts_with("/style") {
+                    in_script = false;
+                }
+                tag_buf.clear();
+                in_tag = false;
+                if !in_script {
+                    out.push(' ');
+                }
+            } else {
+                tag_buf.push(ch);
+            }
+        } else if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else if !in_script {
+            out.push(ch);
+        }
+    }
+
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"");
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // --- Agentic Loop (T0009) ---
 
 use rig_derive::rig_tool;
@@ -638,6 +700,211 @@ async fn open_app(
     }
 }
 
+/// List all saved skills with their names and descriptions.
+#[rig_tool]
+async fn list_skills() -> Result<String, ToolError> {
+    emit_tool_event("list_skills", "", "start", None);
+    let dir = skills_dir();
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(skill) = serde_json::from_str::<SkillDef>(&content) {
+                        let params = if skill.parameters.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (params: {})", skill.parameters.join(", "))
+                        };
+                        skills.push(format!("{}{}: {}", skill.name, params, skill.description));
+                    }
+                }
+            }
+        }
+    }
+    let result = if skills.is_empty() {
+        "No skills saved yet.".to_string()
+    } else {
+        skills.join("\n")
+    };
+    emit_tool_event("list_skills", "", "done", Some(&result));
+    Ok(result)
+}
+
+/// Save a reusable PowerShell procedure as a named skill for future use.
+#[rig_tool]
+async fn create_skill(
+    /// Short identifier for the skill, no spaces (e.g. "get_battery")
+    name: String,
+    /// One-sentence description of what the skill does
+    description: String,
+    /// JSON array of parameter names the skill accepts, e.g. ["query"] or []
+    parameters: String,
+    /// PowerShell script for the skill. Reference parameters as $paramname variables.
+    powershell_code: String,
+) -> Result<String, ToolError> {
+    emit_tool_event("create_skill", &name, "start", None);
+
+    let params: Vec<String> = serde_json::from_str(&parameters).unwrap_or_default();
+    let skill = SkillDef { name: name.clone(), description, parameters: params, powershell_code };
+    let path = skills_dir().join(format!("{}.json", name));
+    let json = serde_json::to_string_pretty(&skill)
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+    std::fs::write(&path, json)
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let msg = format!("Skill '{}' saved.", name);
+    emit_tool_event("create_skill", &name, "done", Some(&msg));
+    Ok(msg)
+}
+
+/// Run a saved skill by name, passing parameters as a JSON object.
+#[rig_tool]
+async fn use_skill(
+    /// The skill name to run
+    name: String,
+    /// Parameters as a JSON object, e.g. {"query": "hello"} or {}
+    params: String,
+) -> Result<String, ToolError> {
+    emit_tool_event("use_skill", &name, "start", None);
+
+    let path = skills_dir().join(format!("{}.json", name));
+    let content = std::fs::read_to_string(&path)
+        .map_err(|_| ToolError::ToolCallError(format!("Skill '{}' not found.", name).into()))?;
+    let skill: SkillDef = serde_json::from_str(&content)
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let param_map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&params).unwrap_or_default();
+
+    let mut preamble = String::new();
+    for (k, v) in &param_map {
+        let val = match v {
+            serde_json::Value::String(s) => {
+                let escaped = s.replace('`', "``").replace('"', "`\"").replace('$', "`$");
+                format!("\"{}\"", escaped)
+            }
+            other => other.to_string(),
+        };
+        preamble.push_str(&format!("${} = {};\n", k, val));
+    }
+
+    let full_command = format!("{}{}", preamble, skill.powershell_code);
+
+    let output = tokio::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &full_command])
+        .output()
+        .await
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    if !output.status.success() {
+        let err = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+        emit_tool_event("use_skill", &name, "error", Some(&err));
+        return Err(ToolError::ToolCallError(err.into()));
+    }
+
+    let result = match (stdout.trim(), stderr.trim()) {
+        ("", "") => "Done (no output).".to_string(),
+        ("", err) => format!("(stderr) {}", err),
+        (out, "") => out.to_string(),
+        (out, err) => format!("{}\n(stderr) {}", out, err),
+    };
+
+    emit_tool_event("use_skill", &name, "done", Some(&result));
+    Ok(result)
+}
+
+/// Fetch the plain-text content of a web page.
+#[rig_tool]
+async fn web_fetch(
+    /// The URL to fetch
+    url: String,
+) -> Result<String, ToolError> {
+    emit_tool_event("web_fetch", &url, "start", None);
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .build()
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let html = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?
+        .text()
+        .await
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let text = strip_html_tags(&html);
+    let truncated = if text.len() > 3000 {
+        format!("{}... [truncated — {} chars remaining. Call web_fetch again on a more specific URL if you need more.]", &text[..3000], text.len() - 3000)
+    } else {
+        text
+    };
+
+    emit_tool_event("web_fetch", &url, "done", Some(&format!("{} chars", truncated.len())));
+    Ok(truncated)
+}
+
+/// Search the web and return top results with titles, URLs, and descriptions.
+#[rig_tool]
+async fn web_search(
+    /// The search query
+    query: String,
+) -> Result<String, ToolError> {
+    emit_tool_event("web_search", &query, "start", None);
+
+    let api_key = std::env::var("BRAVE_API_KEY").map_err(|_| {
+        ToolError::ToolCallError(
+            "BRAVE_API_KEY not set. Add it to .env to enable web search.".into(),
+        )
+    })?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .query(&[("q", query.as_str()), ("count", "5")])
+        .header("Accept", "application/json")
+        .header("X-Subscription-Token", api_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ToolError::ToolCallError(e.to_string().into()))?;
+
+    let results = json["web"]["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let title = r["title"].as_str().unwrap_or("(no title)");
+                    let url = r["url"].as_str().unwrap_or("");
+                    let desc = r["description"].as_str().unwrap_or("");
+                    format!("{}. {} ({})\n   {}", i + 1, title, url, desc)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "No results found.".to_string());
+
+    emit_tool_event("web_search", &query, "done", Some(&results));
+    Ok(results)
+}
+
 struct ConversationState(tokio::sync::Mutex<Vec<rig_core::completion::Message>>);
 
 #[tauri::command]
@@ -663,12 +930,24 @@ async fn agent_chat(
         .agent(openai::GPT_4O)
         .preamble(
             "You are GlideWin, an AI assistant running on the user's Windows PC. \
-             You have two tools: run_powershell for system commands, and open_app for launching \
-             apps or websites. To open an app use open_app with the shell name (e.g. app=\"chrome\", \
-             url=\"\"). To open a URL in a specific browser use open_app with app=\"chrome\" or \
-             app=\"msedge\" and url=\"https://...\". To open a URL in the default browser use \
+             \
+             SYSTEM TOOLS: run_powershell for one-off commands; open_app for launching apps or \
+             websites. To open an app: app=\"chrome\", url=\"\". To open a URL in a specific \
+             browser: app=\"chrome\", url=\"https://...\". To open a URL in the default browser: \
              app=\"https://...\" and url=\"\". Always prefer open_app over run_powershell for \
-             launching applications or websites. \
+             launching applications. \
+             \
+             WEB TOOLS: Always use web_search first — its title and snippet results are usually \
+             sufficient. Only call web_fetch when you genuinely need to read the full content of \
+             a specific page (e.g. documentation, a tutorial, or code). web_fetch is capped at \
+             3000 chars and will tell you if content was truncated. \
+             \
+             SKILL SYSTEM: Skills are saved, reusable PowerShell procedures. \
+             Use list_skills to see what's available. \
+             Use use_skill to run a skill by name with a JSON params object. \
+             Use create_skill to save a new reusable procedure — do this whenever you solve a \
+             task that is likely to be repeated. Skills use $paramname PowerShell variables. \
+             \
              Always tell the user what you are about to do before calling a tool. \
              Keep responses concise. Never delete files or make destructive changes \
              without explicit user confirmation.",
@@ -677,6 +956,11 @@ async fn agent_chat(
         .default_max_turns(10)
         .tool(RunPowershell)
         .tool(OpenApp)
+        .tool(ListSkills)
+        .tool(CreateSkill)
+        .tool(UseSkill)
+        .tool(WebFetch)
+        .tool(WebSearch)
         .build();
 
     let user_content: OneOrMany<UserContent> = match screenshot_path {
