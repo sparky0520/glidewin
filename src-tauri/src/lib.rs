@@ -10,6 +10,18 @@ extern "system" {
     fn SetWindowDisplayAffinity(hwnd: *mut std::ffi::c_void, affinity: u32) -> i32;
 }
 
+// DWMWA_CAPTION_COLOR (35) sets the title-bar background; requires Windows 11 Build 22000+.
+#[cfg(target_os = "windows")]
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut std::ffi::c_void,
+        dw_attribute: u32,
+        pv_attribute: *const std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
+}
+
 fn do_capture_screen() -> Result<String, String> {
     use xcap::Monitor;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -905,6 +917,115 @@ async fn web_search(
     Ok(results)
 }
 
+// ── Conversation History ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolCallRecord {
+    tool: String,
+    input: String,
+    output: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationRecord {
+    id: String,
+    timestamp: u64,
+    transcript: String,
+    response: String,
+    screenshot_path: Option<String>,
+    tool_calls: Vec<ToolCallRecord>,
+}
+
+#[allow(dead_code)]
+struct HistoryState(tokio::sync::Mutex<Vec<ConversationRecord>>);
+
+fn history_file_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| std::env::temp_dir());
+    base.join("glidewin").join("history.json")
+}
+
+fn load_history_from_disk() -> Vec<ConversationRecord> {
+    let path = history_file_path();
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+#[allow(dead_code)]
+fn save_history_to_disk(records: &[ConversationRecord]) {
+    let path = history_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(data) = serde_json::to_string_pretty(records) {
+        let _ = std::fs::write(&path, data);
+    }
+}
+
+#[tauri::command]
+async fn save_conversation(
+    state: tauri::State<'_, HistoryState>,
+    record: ConversationRecord,
+) -> Result<(), String> {
+    let mut history = state.0.lock().await;
+    history.insert(0, record);
+    history.truncate(20);
+    save_history_to_disk(&history);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_history(state: tauri::State<'_, HistoryState>) -> Result<Vec<ConversationRecord>, String> {
+    Ok(state.0.lock().await.clone())
+}
+
+#[tauri::command]
+async fn load_conversation(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, HistoryState>,
+    id: String,
+) -> Result<(), String> {
+    use tauri::{Emitter, Manager};
+    let history = state.0.lock().await;
+    if let Some(record) = history.iter().find(|r| r.id == id) {
+        if let Some(win) = app.get_webview_window("main") {
+            win.emit("load-conversation", record.clone()).map_err(|e| e.to_string())?;
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn toggle_history_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("history") {
+        if win.is_visible().unwrap_or(false) {
+            win.hide().map_err(|e| e.to_string())
+        } else {
+            win.show().map_err(|e| e.to_string())?;
+            win.set_focus().map_err(|e| e.to_string())
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn read_screenshot(path: String) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose};
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    Ok(general_purpose::STANDARD.encode(&bytes))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct ConversationState(tokio::sync::Mutex<Vec<rig_core::completion::Message>>);
 
 #[tauri::command]
@@ -1021,6 +1142,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(RecorderState(Mutex::new(None)))
         .manage(ConversationState(tokio::sync::Mutex::new(Vec::new())))
+        .manage(HistoryState(tokio::sync::Mutex::new(load_history_from_disk())))
         .setup(|app| {
             use tauri::Manager;
             use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -1039,6 +1161,38 @@ pub fn run() {
             if let Ok(hwnd) = window.hwnd() {
                 const WDA_EXCLUDEFROMCAPTURE: u32 = 0x00000011;
                 unsafe { SetWindowDisplayAffinity(hwnd.0, WDA_EXCLUDEFROMCAPTURE); }
+            }
+
+            // Create history window (hidden; shown via Ctrl+Shift+H or the widget button)
+            let history_win = tauri::WebviewWindowBuilder::new(
+                app,
+                "history",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("GlideWin — History")
+            .inner_size(1200.0, 800.0)
+            .resizable(true)
+            .skip_taskbar(false)
+            .decorations(true)
+            .theme(Some(tauri::Theme::Dark))
+            .visible(false)
+            .build()?;
+
+            // Paint the title bar to match the body background (#0f0f11 = RGB 15,15,17).
+            // COLORREF format: 0x00BBGGRR → 0x00110F0F.
+            // DWMWA_CAPTION_COLOR (35) requires Windows 11 Build 22000+.
+            #[cfg(target_os = "windows")]
+            if let Ok(hwnd) = history_win.hwnd() {
+                const DWMWA_CAPTION_COLOR: u32 = 35;
+                let color: u32 = 0x0011_0F0F;
+                unsafe {
+                    DwmSetWindowAttribute(
+                        hwnd.0,
+                        DWMWA_CAPTION_COLOR,
+                        &color as *const u32 as *const _,
+                        std::mem::size_of::<u32>() as u32,
+                    );
+                }
             }
 
             // Register Ctrl+Shift+Space once at the Rust level so React lifecycle
@@ -1068,6 +1222,24 @@ pub fn run() {
                 });
             })?;
 
+            // Register Ctrl+Shift+H to toggle the history window
+            let handle_h = app.handle().clone();
+            app.global_shortcut().on_shortcut("CommandOrControl+Shift+H", move |_app, _shortcut, event| {
+                if event.state() != ShortcutState::Pressed { return; }
+                let handle_h = handle_h.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    if let Some(win) = handle_h.get_webview_window("history") {
+                        if win.is_visible().unwrap_or(false) {
+                            let _ = win.hide();
+                        } else {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                        }
+                    }
+                });
+            })?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1080,6 +1252,11 @@ pub fn run() {
             speak_text,
             agent_chat,
             clear_conversation,
+            save_conversation,
+            get_history,
+            load_conversation,
+            toggle_history_window,
+            read_screenshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

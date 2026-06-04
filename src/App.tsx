@@ -2,7 +2,14 @@ import { useEffect, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import HistoryView from './HistoryView';
 import './App.css';
+
+// Route history window to its own view before mounting the widget.
+const WINDOW_LABEL = getCurrentWindow().label;
+if (WINDOW_LABEL === 'history') {
+  // Rendered at the bottom of this file via the exported App component.
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -37,9 +44,21 @@ const SILENCE_THRESHOLD = 0.02;
 // How long silence must persist (ms) before auto-submitting.
 const SILENCE_DURATION_MS = 1500;
 
+// ── Shared type (mirrored from Rust ConversationRecord) ────────────────────
+
+type ConversationRecord = {
+  id: string;
+  timestamp: number;
+  transcript: string;
+  response: string;
+  screenshotPath?: string | null;
+  toolCalls: { tool: string; input: string; output?: string | null; status: string }[];
+};
+
 // ── App ────────────────────────────────────────────────────────────────────
 
 function App() {
+  if (WINDOW_LABEL === 'history') return <HistoryView />;
   const [error, setError]                       = useState<string | null>(null);
   const [isRecording, setIsRecording]           = useState(false);
   const [elapsed, setElapsed]                   = useState(0);
@@ -112,8 +131,24 @@ function App() {
       pendingToolCallsRef.current = [];
       setActiveToolCalls([]);
       setLastResponse(response);
-      if (toolCalls.length > 0) console.debug('[glidewin] tool calls:', toolCalls);
       speakResponse(response);
+
+      // Persist to history (fire-and-forget)
+      invoke('save_conversation', {
+        record: {
+          id: Date.now().toString(),
+          timestamp: Math.floor(Date.now() / 1000),
+          transcript: msg,
+          response,
+          screenshotPath: screenshotRef.current ?? null,
+          toolCalls: toolCalls.map(t => ({
+            tool: t.tool,
+            input: t.input,
+            output: t.output ?? null,
+            status: t.status,
+          })),
+        } satisfies ConversationRecord,
+      }).catch(() => {/* non-critical */});
     } catch (e: any) {
       pendingToolCallsRef.current = [];
       setActiveToolCalls([]);
@@ -228,6 +263,25 @@ function App() {
     return () => unlisten?.();
   }, []);
 
+  // Restores a past conversation into the widget when selected from the history view.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<ConversationRecord>('load-conversation', e => {
+      const r = e.payload;
+      setTranscript(r.transcript);
+      setLastResponse(r.response);
+      screenshotRef.current = r.screenshotPath ?? null;
+      setHasScreenshot(!!r.screenshotPath);
+      setActiveToolCalls(r.toolCalls.map(t => ({
+        tool: t.tool,
+        input: t.input,
+        output: t.output ?? undefined,
+        status: t.status as 'running' | 'done' | 'error',
+      })));
+    }).then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
+
   // Silence detection: Rust emits normalized RMS every 100ms while recording.
   // We start a 1.5s countdown after the first silence post-speech; expiry auto-submits.
   useEffect(() => {
@@ -330,6 +384,7 @@ function App() {
           {statusLabel}
         </div>
         {contentLine && <div className="content">{contentLine}</div>}
+        <button className="history-btn" onClick={() => invoke('toggle_history_window')} title="History (Ctrl+Shift+H)">☰</button>
         <button className="close-btn" onClick={dismissWindow} title="Dismiss (Esc)">✕</button>
       </div>
       <div className="hint" data-tauri-drag-region data-countdown={silenceCountdown !== null ? '' : undefined}>
