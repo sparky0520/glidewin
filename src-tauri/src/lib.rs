@@ -1156,7 +1156,8 @@ fn tool_schemas() -> serde_json::Value {
         {"type":"function","function":{"name":"type_text","description":"Type text at the current cursor position. Focus the target field first.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}},
         {"type":"function","function":{"name":"key_combo","description":"Press a key or combination: 'ctrl+c', 'alt+f4', 'win+d', 'enter', 'escape', 'ctrl+shift+t'.","parameters":{"type":"object","properties":{"keys":{"type":"string"}},"required":["keys"]}}},
         {"type":"function","function":{"name":"take_screenshot","description":"Capture a fresh screenshot to see current screen state. Call after clicking or typing to verify the result.","parameters":{"type":"object","properties":{}}}},
-        {"type":"function","function":{"name":"think","description":"Use only when something unexpected happens and you need to reason through how to recover. Do not use for planning or narrating normal steps.","parameters":{"type":"object","properties":{"thought":{"type":"string","description":"Your recovery reasoning."}},"required":["thought"]}}}
+        {"type":"function","function":{"name":"think","description":"Use only when something unexpected happens and you need to reason through how to recover. Do not use for planning or narrating normal steps.","parameters":{"type":"object","properties":{"thought":{"type":"string","description":"Your recovery reasoning."}},"required":["thought"]}}},
+        {"type":"function","function":{"name":"task_complete","description":"Call this when the task is fully finished. Pass a brief confirmation message to relay to the user. This ends the agent loop.","parameters":{"type":"object","properties":{"message":{"type":"string","description":"Short confirmation of what was done."}},"required":["message"]}}}
     ])
 }
 
@@ -1228,7 +1229,7 @@ SKILLS: Check list_skills before starting a task — a skill may already exist. 
 Save a new skill with create_skill whenever you solve something likely to be repeated.\n\
 GUI: Focus the target window or field before typing. After every click or keystroke, take a screenshot to confirm the result.\n\
 Complete tasks fully from start to finish. Do not narrate your steps, announce what you are about to do, or give the user instructions — just act. \
-Speak only once at the very end to confirm the task is done. Never delete files or make destructive changes without explicit confirmation.\n\
+When the task is fully done, call task_complete with a brief confirmation message. Never delete files or make destructive changes without explicit confirmation.\n\
 EXAMPLE — User says \"Play Back in Black on Spotify\":\n\
 1. open_app: open Spotify.\n\
 2. take_screenshot: see the loaded app.\n\
@@ -1237,7 +1238,7 @@ EXAMPLE — User says \"Play Back in Black on Spotify\":\n\
 5. take_screenshot: see the search results.\n\
 6. mouse_click: click play on the correct result.\n\
 7. take_screenshot: confirm the song is playing.\n\
-8. Report done.";
+8. task_complete: \"Playing Back in Black on Spotify.\"";
 
 async fn run_agent_loop(
     api_key: &str,
@@ -1263,6 +1264,7 @@ async fn run_agent_loop(
         if finish == "tool_calls" {
             let calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
             let mut screenshot_paths: Vec<String> = Vec::new();
+            let mut completion_message: Option<String> = None;
 
             for call in &calls {
                 let call_id = call["id"].as_str().unwrap_or("");
@@ -1270,6 +1272,14 @@ async fn run_agent_loop(
                 let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
                 let args: serde_json::Value =
                     serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+
+                if name == "task_complete" {
+                    let message = args["message"].as_str().unwrap_or("Done.").to_string();
+                    emit_tool_event("task_complete", &message, "done", None);
+                    history.push(serde_json::json!({"role":"tool","tool_call_id":call_id,"content":"Task marked complete."}));
+                    completion_message = Some(message);
+                    continue;
+                }
 
                 let tool_msg = match dispatch_tool(name, &args).await {
                     // image_url is not valid inside tool-role messages; collect paths and
@@ -1283,6 +1293,10 @@ async fn run_agent_loop(
                     }
                 };
                 history.push(tool_msg);
+            }
+
+            if let Some(message) = completion_message {
+                return Ok(message);
             }
 
             // Inject each screenshot as a user message so the model can see the image.
