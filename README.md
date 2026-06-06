@@ -1,4 +1,4 @@
-# Sharp - You say, it does
+# Sharp - You Say, It Does
 
 I got the inspiration from [clicky by Farza](https://x.com/heyclicky) and frustration with Microsoft Windows Copilot which can't really do stuff.
 
